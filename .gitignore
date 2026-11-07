@@ -1,0 +1,22 @@
+# Never commit game dumps, keys, or Apple signing material
+*.keys
+*.xci
+*.nsp
+*.nca
+*.nup
+*.ipa
+*.app/
+*.mobileprovision
+*.p12
+*.cer
+*.certSigningRequest
+entitlements.plist
+**/Payload/
+**/input/
+**/artifacts/
+**/source/
+.DS_Store
+__pycache__/
+.iosdd/
+.iosdd_*/
+.codegraph/

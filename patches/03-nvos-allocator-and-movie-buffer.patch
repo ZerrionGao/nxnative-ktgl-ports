@@ -1,0 +1,117 @@
+commit b93823bee7f49abf3dde840cccd1a8e162a6db1f
+Author: seedds <seedds@gmail.com>
+Date:   Fri Nov 6 07:30:21 2026 -0500
+
+    把游戏的图形分配器装进 NvOs，并接受 SDK 1.6 非 const 的影片缓冲访问
+    
+    只在宿主记下分配器时，影片解复用会在空指针上构造消息；这份 SDK 的 Buffer 访问也不是 const。
+
+diff --git a/dm/gfx/hle_nv.c b/dm/gfx/hle_nv.c
+index 9e80d1c4..f09f129f 100644
+--- a/dm/gfx/hle_nv.c
++++ b/dm/gfx/hle_nv.c
+@@ -11,8 +11,17 @@ struct nv_allocator g_nv_alloc, g_nv_devtools_alloc;
+ static struct { void *mem; unsigned long size; int inited; } g_nv_pool;
+ 
+ #define WHY "NVN has been replaced wholesale with a host null device, so the driver glue layer has nothing to do"
+-HLE_FORCE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", WHY "; allocator recorded in g_nv_alloc",
+-          void, h_nv_SetAlloc, nv_alloc_fn a, nv_free_fn f, nv_realloc_fn r, void *u) { g_nv_alloc = (struct nv_allocator){a, f, r, u}; }
++// The module's own SetGraphicsAllocator is what installs these callbacks as NvOs's allocator. Recording them only on the host leaves NvOs on its default heap, which grows through
++// nn::os::AllocateMemoryBlock. That fails once the game has taken the process heap, operator new returns null, and the caller still constructs on it (the movie player's AMessage).
++static void nv_install_guest(const char *sym, nv_alloc_fn a, nv_free_fn f, nv_realloc_fn r, void *u) {
++    void (*orig)(nv_alloc_fn, nv_free_fn, nv_realloc_fn, void *) = guest_sym(sym);
++    if (orig) orig(a, f, r, u);
++}
++HLE_FORCE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", WHY "; allocator recorded in g_nv_alloc and installed in the guest module",
++          void, h_nv_SetAlloc, nv_alloc_fn a, nv_free_fn f, nv_realloc_fn r, void *u) {
++    g_nv_alloc = (struct nv_allocator){a, f, r, u};
++    nv_install_guest("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", a, f, r, u);
++}
+ HLE_FORCE("_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", WHY "; allocator recorded in g_nv_devtools_alloc",
+           void, h_nv_SetDevAlloc, nv_alloc_fn a, nv_free_fn f, nv_realloc_fn r, void *u) { g_nv_devtools_alloc = (struct nv_allocator){a, f, r, u}; }
+ HLE_FORCE("_ZN2nv18InitializeGraphicsEPvm", WHY "; pool recorded for nv::GetGraphicsMemoryInfo", void, h_nv_Init, void *mem, unsigned long size) {
+diff --git a/dm/host/hle_movie.c b/dm/host/hle_movie.c
+index 75624271..65f99ea7 100644
+--- a/dm/host/hle_movie.c
++++ b/dm/host/hle_movie.c
+@@ -118,17 +118,19 @@ static struct {
+ static _Atomic uint64_t g_movie_pic_ns;   // when a video decoder last handed out a picture (0 = stopped since)
+ int dm_movie_playing(void) { uint64_t t = atomic_load_explicit(&g_movie_pic_ns, memory_order_relaxed); return t && now_ns() - t < MD_PLAYING_NS; }
+ static void *msym(const char *n) { void *p = guest_sym(n); if (!p) die("movie: missing SDK symbol %s", n); return p; }
++// SDK 1.6's Buffer accessors are non-const (Data, Capacity, Size). Later SDKs added const overloads; the pointer and the return are the same either way.
++static void *msym2(const char *a, const char *b) { void *p = guest_sym(a); return p ? p : msym(b); }
+ static void md_syms(void) {
+     if (G.signal) return;
+     G.set_data = msym("_ZN5movie6Buffer18SetDataAndCapacityEPvm");
+     G.set_range = msym("_ZN5movie6Buffer8SetRangeEii");
+-    G.data = msym("_ZNK5movie6Buffer4DataEv");
+-    G.cap = msym("_ZNK5movie6Buffer8CapacityEv");
++    G.data = msym2("_ZNK5movie6Buffer4DataEv", "_ZN5movie6Buffer4DataEv");
++    G.cap = msym2("_ZNK5movie6Buffer8CapacityEv", "_ZN5movie6Buffer8CapacityEv");
+     G.set_i32 = msym("_ZN5movie9MediaData8SetInt32EPKci");
+     G.set_rect = msym("_ZN5movie9MediaData7SetRectEPKciiii");
+     G.find_i32 = msym("_ZNK5movie9MediaData9FindInt32EPKcPi");
+     G.find_buf = msym("_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE");
+-    G.size = msym("_ZNK5movie6Buffer4SizeEv");
++    G.size = msym2("_ZNK5movie6Buffer4SizeEv", "_ZN5movie6Buffer4SizeEv");
+     G.signal = msym("_ZN2nn2os11SignalEventEPNS0_9EventTypeE");
+ }
+ static mdec_t *md_of(void **self) { return self ? (mdec_t *)self[1] : NULL; }
+diff --git a/dm/host/tests/t_nv.c b/dm/host/tests/t_nv.c
+index a7ecfdf3..82838d86 100644
+--- a/dm/host/tests/t_nv.c
++++ b/dm/host/tests/t_nv.c
+@@ -5,6 +5,12 @@
+ static int sdk;
+ int dm_sdk_major(void) { return sdk; }
+ 
++static int guest_alloc_calls;
++static void guest_set_alloc(void *a, void *b, void *c, void *d) { (void)a; (void)b; (void)c; (void)d; guest_alloc_calls++; }
++void *guest_sym(const char *name) {
++    return name && !strcmp(name, "_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") ? (void *)guest_set_alloc : NULL;
++}
++
+ // The record between two guard words; after it, the old record again in an allocation of exactly its size, for AddressSanitizer
+ static void check(int major, uint64_t pool) {
+     sdk = major;
+@@ -29,6 +35,8 @@ int main(void) {
+         h_nv_Fin();
+         check(majors[i], 0);
+     }
++    h_nv_SetAlloc(NULL, NULL, NULL, NULL);
++    assert(guest_alloc_calls == 1);
+     puts("NV memory: the 0x20-byte record on SDK 10 and older, 0x40 bytes from SDK 11 on, pool figures in both");
+     return 0;
+ }
+diff --git a/docs/reference/movies.md b/docs/reference/movies.md
+index f54a3852..0c0bc11d 100644
+--- a/docs/reference/movies.md
++++ b/docs/reference/movies.md
+@@ -159,6 +159,13 @@ A decoder hands out as many outputs as it has slots, and while every slot is tak
+ - **Fix:** the host converts the VP9 picture to RGBA (BT.709 / BT.601 and range from the stream) and writes it into the texture's storage like `WriteTexels`, then marks the sync as signalled (`nvn_host_write_texture` / `nvn_host_signal_sync` in `hle_nvn.c`). The host writes the texture's block-linear storage on the CPU and the replay layer re-uploads the dirtied pages, as for `WriteTexels` ([nvn-objects.md](nvn-objects.md)).
+ - **Found on:** [Metroid Dread](../../dm/games/010093801237C000/README.md).
+ 
++### SDK 1.6's `movie::Buffer` accessors are not const
++
++- **Symptom:** `FATAL movie: missing SDK symbol _ZNK5movie6Buffer4DataEv` as the first movie's decoder is constructed (`h_movie_Decoder` ← the two-argument `movie::Decoder` constructor).
++- **Cause:** SDK 1.6 exports `movie::Buffer::Data`, `Capacity` and `Size` as non-const. The host looked up only the const overloads later SDKs added.
++- **Fix:** `md_syms` (`hle_movie.c`) takes the const symbol when the module has it, and the non-const one otherwise. The pointer and the return are the same.
++- **Found on:** 無双OROCHI２ Ultimate (`0100153006300000`, 1.0.0, SDK 1.6.0). Not in the games table.
++
+ ### SDK 4's `movie::Buffer` has no sync object
+ 
+ - **Symptom:** `FATAL movie: missing SDK symbol _ZNK5movie6Buffer10GetNvnSyncEv` at the first frame of the native-texture movie (H.264 into the game's RGBA texture, as in Monster Hunter Rise).
+@@ -201,6 +208,13 @@ A decoder hands out as many outputs as it has slots, and while every slot is tak
+ - **Fix** (`hle_movie.c`, `md_out_tex`): for BGRX8, BGRA8 and their sRGB forms (NVN formats 0x99 to 0x9C), the picture goes through a per-decoder copy with red and blue swapped. The slot's own picture stays RGBA, as a slot can be read twice.
+ - **Found on:** [TRIANGLE STRATEGY](../../dm/games/0100CC80140F8000/README.md) (the title screen's background movies; BGRA8).
+ 
++### The movie player's `NvOs` heap never receives the game's allocator
++
++- **Symptom:** a few frames, then `CRASH sig=11 addr=0` in the NVN module, the return address in the movie module. The fault is `android::RefBase`'s constructor storing its vtable through a null `this`, called from `android::AMessage::AMessage`, called from `android::NuCachedSource2::readAt` while `movie::NnExtractor::SetDataSource` parses an MPEG-4. `operator new` (`android::HeapObject::operator new` → `NvOsAlloc`) returned null. The message id in the registers is the fourcc `read`.
++- **Cause:** the host takes over `nv::SetGraphicsAllocator` and only records the callbacks. The NVN module's own function is what installs them as `NvOs`'s allocator. Without that, `NvOsAlloc` stays on the module's default heap (16 KB, then `nn::os::AllocateMemoryBlock`). The game has already taken the process heap, so the first allocation that does not fit (here 0xa20, the cached read's `AMessage`) comes back null, and `readAt` constructs the message before it checks the pointer.
++- **Fix:** `h_nv_SetAlloc` (`dm/gfx/hle_nv.c`) still records the callbacks for the host, then calls the module's own `nv::SetGraphicsAllocator`, which points `NvOsAlloc` at the game's allocator. `nv::InitializeGraphics` stays on the host: that is the call that opens the driver.
++- **Found on:** 無双OROCHI２ Ultimate (`0100153006300000`, 1.0.0, SDK 1.6.0). Not in the games table. The opening movie's demuxer (`subsdk3`) allocates through the NVN module's `NvOs` (`subsdk4`).
++
+ ## Demuxers and codecs
+ 
+ ### `movie::Extractor` runs natively

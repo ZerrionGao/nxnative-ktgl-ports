@@ -1,0 +1,70 @@
+commit eca2fa75b8ab650c61edf76b099896e609dd80fd
+Author: seedds <seedds@gmail.com>
+Date:   Fri Nov 6 07:30:21 2026 -0500
+
+    跳转表在索引被重新加载后仍认加载旁边的范围检查
+    
+    较近的一次比较会挡住真正的边界，改写器因此放弃这张表。
+
+diff --git a/dm/tools/patch_nso.py b/dm/tools/patch_nso.py
+index 98a7b27a..7cfb5b97 100644
+--- a/dm/tools/patch_nso.py
++++ b/dm/tools/patch_nso.py
+@@ -735,7 +735,12 @@ def jump_offsets(insl, j, copy_first=False, far_base=False, forward_base=False):
+                     cmp = p
+                 break
+             if cmp: break
+-    if cmp and changed: return None   # the index changes after the check. Before a check it does not matter, so this waits for the walk to find one
++    if cmp and changed:
++        # The compare the walk reached does not bound this load: the index was reloaded, then copied, then checked again beside the load
++        # (無双OROCHI２ Ultimate main+0x1bb31c: cmp w18,#3; b.hs; ldr w18,[x20,#0xc]; mov w0,w18; cmp w18,#3; b.hi; ldrsw x18,[x16,x0,lsl #2]).
++        # Drop it only on the last attempt, which then reads the check next to the load. An earlier attempt still fails the site, so a table recognized before stays as it was
++        if not copy_first: return None
++        cmp = None
+     if not cmp and copy_first: cmp = check_before_copy(insl, ctx, ld, idx | copies)
+     if not cmp: return None
+     n = int(cmp.op_str.split('#')[1], 0) + 1
+diff --git a/dm/tools/tests/test_jump_copies.py b/dm/tools/tests/test_jump_copies.py
+index fc7667ca..4d2f8a19 100644
+--- a/dm/tools/tests/test_jump_copies.py
++++ b/dm/tools/tests/test_jump_copies.py
+@@ -220,6 +220,22 @@ class IndexChangedAfterCheck(unittest.TestCase):
+         ins = list(md.disasm(struct.pack('<' + 'I' * len(words), *words), 0))
+         self.assertEqual(scope['jump_offsets'](ins, 8, copy_first=True), targets)
+ 
++    def test_a_reloaded_index_uses_the_check_beside_the_load(self):
++        # cmp w18,#7; b.hs; ldr w18,[x20,#0xc]; mov w0,w18; cmp w18,#3; b.hi; ldrsw x18,[x16,x0,lsl #2]
++        # The walk follows w0 back to w18, then meets the reload and the earlier compare. That compare is not this table.
++        words = [ADRP(16, 0, self.TABLE), ADDI(16, 16, self.TABLE & 0xfff), 0x7100001f | 7 << 10 | 18 << 5, 0x540001a2,
++                 0xb9400e92, mov(0, 18, False), 0x7100001f | 3 << 10 | 18 << 5, bhi(28, 64),
++                 0xb8a07800 | 16 << 5 | 18, ADDR(18, 18, 16), BR(18)] + [RET] * 5
++        targets = [44 + i * 4 for i in range(4)]
++        for i, target in enumerate(targets): struct.pack_into('<i', IMG, self.TABLE + 4 * i, target - self.TABLE)
++        struct.pack_into('<i', IMG, self.TABLE + 16, 0x1000)   # an eighth entry the stale compare would read
++        md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
++        ins = list(md.disasm(struct.pack('<' + 'I' * len(words), *words), 0))
++        self.assertEqual(len(ins), len(words))
++        j = next(i for i, p in enumerate(ins) if p.mnemonic == 'br')
++        self.assertIsNone(scope['jump_offsets'](ins, j))
++        self.assertEqual(scope['jump_offsets'](ins, j, copy_first=True, far_base=True), targets)
++
+ 
+ class ForwardBase(unittest.TestCase):
+     """Entry jumps over the dispatch to its sole base initialization, then branches backward."""
+diff --git a/docs/reference/rewriter.md b/docs/reference/rewriter.md
+index e6c7ebda..8b96e716 100644
+--- a/docs/reference/rewriter.md
++++ b/docs/reference/rewriter.md
+@@ -67,9 +67,9 @@ To enroll a cut for any game's own module:
+ ### Index copied before the bounds check
+ 
+ - **Symptom:** `jump table <addr>` assertion where the index is a copy made before the check (`mov w0,w18`, then 41 instructions holding two other jump tables on `x0`, then `cmp w18,#4; b.hi; ldrsw x18,[x11,x0,lsl #2]; add x18,x18,x11; br x18`).
+-- **Cause:** every other form follows copies made after the bounds check.
+-- **Fix:** `check_before_copy` accepts the `cmp` and `b.hi` right before the load when a `mov wI, wS` is the last writer of both registers; capstone lists a `cmp`'s first operand as written, which the search skips. The search follows the function boundary rather than an arbitrary instruction count, stopping at undecodable gaps and calls that can clobber either register. It runs only when every other form has failed.
+-- **Found on:** [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md) `main+0x2dd8cd0`; [Mario + Rabbids Kingdom Battle](../../dm/games/010067300059A000/README.md) `subsdk0+0x7340b8`, whose copy is 71 instructions before the load, across two switches preserving both registers (beyond the former 64-instruction limit).
++- **Cause:** every other form follows copies made after the bounds check. A nearer `cmp` of the same register can also hide that check: the walk follows the copy back to the source, meets a reload of the source, and rejects the site because the index changed, without looking at the `cmp` / `b.hi` directly in front of the load.
++- **Fix:** `check_before_copy` accepts the `cmp` and `b.hi` right before the load when a `mov wI, wS` is the last writer of both registers; capstone lists a `cmp`'s first operand as written, which the search skips. The search follows the function boundary rather than an arbitrary instruction count, stopping at undecodable gaps and calls that can clobber either register. On the last attempt only, a compare the walk already reached is dropped when the index changed after it, so this check can run. It runs only when every other form has failed.
++- **Found on:** [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md) `main+0x2dd8cd0`; [Mario + Rabbids Kingdom Battle](../../dm/games/010067300059A000/README.md) `subsdk0+0x7340b8`, whose copy is 71 instructions before the load, across two switches preserving both registers (beyond the former 64-instruction limit); 無双OROCHI２ Ultimate (`0100153006300000`) `main+0x1bb31c`, where `ldr w18` sits between an earlier `cmp w18,#3` and `mov w0,w18; cmp w18,#3; b.hi`.
+ - **Note:** before fixing one site, a census of all of them saves a run per site: a copy of `patch_nso.py` whose assert prints and continues found this one alone among the 25,508 `x18` sites. That `main` has no unwind entries for its first 70 MB, so the rewriter disassembles them as one function and takes 6 minutes (see [Long functions analysed in pieces](#long-functions-analysed-in-pieces)).
+ 
+ ### 64-bit bounds check of the index

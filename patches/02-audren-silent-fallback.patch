@@ -1,0 +1,224 @@
+commit 2bc2cb6ad022b5d3571be7f90775f60eadddbf6b
+Author: seedds <seedds@gmail.com>
+Date:   Fri Nov 6 07:30:21 2026 -0500
+
+    没有进程内渲染器的 SDK 在本地应答 audren，避免启动时 Break
+    
+    这类 SDK 会去连 audren:u，服务不存在就自行中止。本地应答没有混音器，所以没有声音。
+
+diff --git a/dm/host/hle_audren.c b/dm/host/hle_audren.c
+index fb9e4de5..db7f740a 100644
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -11,6 +11,8 @@
+ //      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and clamps its input mix buffers (int32 holding 16-bit range) to int16 stereo for AudioOut (hle_audio.c).
+ // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
+ //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
++// An SDK with none of those render entry points (SDK 1.6: GetAudioRendererWorkBufferSize and OpenAudioRenderer open audren:u and abort when it is not registered) is answered
++// here instead. There is no mixer in that SDK, so the game stays silent. Its audio thread blocks in WaitSystemEvent, and a host thread signals the bound event every 5 ms.
+ #include "hle.h"
+ #include <math.h>
+ #include <stdatomic.h>
+@@ -28,7 +30,7 @@ void dm_pcmout_wait(void *k, int ms);
+ 
+ // P_SIZE: bytes of the game's AudioRendererParameter copied before the two fields are changed. SDK 16's struct is 0x38 bytes; SDK 8's (Link's Awakening) has one more word,
+ // its revision at +0x38: copying only 0x38 left the revision uninitialized and the SDK rejected it (CheckValidRevision, Result 0x499). The SDK reads only its own size of the copy
+-enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF = 4 };
++enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF = 4, SILENT_WORK = 0x800000 };
+ static void *gsym(const char *n) { void *p = guest_sym(n); if (!p) die("audren: missing SDK symbol %s", n); return p; }
+ static void cpu_manual(uint8_t *dst, const uint8_t *src) { memcpy(dst, src, P_SIZE); *(int32_t *)(dst + P_DEVICE) = 1; *(int32_t *)(dst + P_MODE) = 1; }
+ 
+@@ -73,8 +75,24 @@ static size_t ar_service_work_size(const uint8_t *p) {
+     return ar_align(size + commands + 0x7e, WORK_PAGE);
+ }
+ 
++// The in-process renderer the host drives. SDK 1.6 has none of these: its size and open functions connect to audren:u and Break.
++static int ar_cpu_renderer(void) {
++    return guest_sym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE")
++        || guest_sym("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv")
++        || guest_sym("_ZN2nn5audio6server17AudioRenderSystem29ExecuteAudioRendererRenderingEv") ? 1 : 0;
++}
++
+ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE", "renderer work buffer: DSP service budget, with extra local CPU backend storage supplied by the host",
+           size_t, h_ar_WorkSize, const uint8_t *param) {
++    if (!ar_cpu_renderer()) {
++        // The SDK function opens audren:u. The service budget is what that call would have returned; a revision this formula does not know still has to
++        // come back as a size the game can allocate (it is not consumed: there is no renderer to open into it).
++        size_t service = ar_service_work_size(param), n = service ? service : (size_t)SILENT_WORK;
++        uint32_t rev = *(const uint32_t *)(param + 0x34);
++        if ((rev & 0xffffff) != 0x564552) rev = *(const uint32_t *)(param + 0x38);
++        static int once; if (!once++) LOG("audren: no in-process renderer; work buffer %#zx (service %#zx, revision %#x)", n, service, rev);
++        return n;
++    }
+     static size_t (*orig)(const uint8_t *); if (!orig) orig = gsym("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE");
+     uint8_t p[P_SIZE]; cpu_manual(p, param); size_t n = orig(p);
+     size_t service = *(int32_t *)(param + P_DEVICE) == 0 ? ar_service_work_size(p) : 0;
+@@ -152,7 +170,57 @@ static void *rev_find(void *obj) {
+     for (int i = 0; i < 4 && !ev; i++) if (g_rev[i].obj == obj) ev = g_rev[i].ev;
+     pthread_mutex_unlock(&g_rev_mu); return ev;
+ }
++// No in-process renderer: do not call the SDK open (it connects to audren:u and Breaks). The handle is a stand-in the later calls never dereference.
++// The game waits on the event it passed (WaitSystemEvent, no timeout), so a host thread signals the bound auto-clear event every 5 ms.
++static uint8_t g_silent_obj[0x20] __attribute__((aligned(16)));
++static void *g_pulse_ev;
++static _Atomic int g_pulse_run;
++static pthread_t g_pulse_th;
++static int g_pulse_live;
++static pthread_mutex_t g_pulse_mu = PTHREAD_MUTEX_INITIALIZER;
++static void *ar_pulse(void *arg) {
++    (void)arg;
++    while (atomic_load(&g_pulse_run)) {
++        void *ev = g_pulse_ev;
++        if (ev) hle_signal_bound_system_event(ev);
++        usleep(5000);
++    }
++    return NULL;
++}
++static void ar_pulse_stop(void) {
++    pthread_mutex_lock(&g_pulse_mu);
++    int live = g_pulse_live; pthread_t th = 0;
++    if (live) { atomic_store(&g_pulse_run, 0); th = g_pulse_th; }
++    pthread_mutex_unlock(&g_pulse_mu);
++    if (!live) return;
++    pthread_join(th, NULL);
++    pthread_mutex_lock(&g_pulse_mu); g_pulse_live = 0; g_pulse_ev = NULL; pthread_mutex_unlock(&g_pulse_mu);
++}
++static void ar_pulse_start(void *ev) {
++    pthread_mutex_lock(&g_pulse_mu);
++    g_pulse_ev = ev;
++    if (!g_pulse_live) {
++        atomic_store(&g_pulse_run, 1);
++        if (pthread_create(&g_pulse_th, NULL, ar_pulse, NULL)) {
++            atomic_store(&g_pulse_run, 0); g_pulse_ev = NULL;
++            pthread_mutex_unlock(&g_pulse_mu);
++            LOG("[RED] audren: cannot start the renderer event thread");
++            return;
++        }
++        g_pulse_live = 1;
++    }
++    pthread_mutex_unlock(&g_pulse_mu);
++}
++static Result ar_open_silent(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
++    if (handle) { handle[0] = g_silent_obj; handle[1] = NULL; }
++    static int once;
++    if (!once++) LOG("audren: OpenAudioRenderer answered locally (no in-process renderer); sound stays silent. rate %d voices %d work %p+%#zx",
++        param ? *(const int32_t *)param : 0, param ? *(const int32_t *)(param + 0x10) : 0, work, sz);
++    if (ev) { hle_bind_system_event(ev, 1); ar_pulse_start(ev); }
++    return RES_OK;
++}
+ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
++    if (!ar_cpu_renderer()) return ar_open_silent(handle, ev, param, work, sz);
+     static Result (*orig_ev)(void **, void *, const uint8_t *, void *, size_t), (*orig)(void **, const uint8_t *, void *, size_t);
+     if (!orig_ev) orig_ev = gsym("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm");
+     if (!orig) orig = gsym("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleERKNS0_22AudioRendererParameterEPvm");
+@@ -208,6 +276,7 @@ HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11S
+ HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleERKNS0_22AudioRendererParameterEPvm", "open the renderer (no event): CPU rendering + manual execution, the host starts a render thread",
+           Result, h_ar_Open0, void **handle, const uint8_t *param, void *work, size_t sz) { return ar_open(handle, NULL, param, work, sz); }
+ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close the renderer: stop the host render thread first, then hand over to the SDK", void, h_ar_Close, void *obj, void *state) {
++    if (!ar_cpu_renderer()) { ar_pulse_stop(); return; }   // the SDK close would load the stand-in handle and Break in the same audren:u client
+     static void (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE");
+     // Join the render thread first (it checks g_open every round and at most every 10 ms while waiting for the output): it may be inside exec(), which uses the renderer the SDK is about to free.
+     // A fixed 20 ms sleep used to stand in for this, and a renderer reopened inside that window ran a second thread over the first one's static buffers
+@@ -220,6 +289,26 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close
+         destroy(sev); rev_set(sev, NULL);
+     }
+ }
++// Start, Stop and RequestUpdate on an SDK with a renderer are the SDK's own (16-byte handle in x0/x1, the config in x2). Without one, the SDK copies load the
++// stand-in and send to audren:u, then Break; the game only checks the result (無双OROCHI２ Ultimate main+0x5eb3d4, main+0x5ebae0).
++HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "start the renderer: the SDK's own when it has one, success without audren:u when it does not",
++          Result, h_ar_Start, void *obj, void *state) {
++    if (!ar_cpu_renderer()) return RES_OK;
++    static Result (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE");
++    return orig(obj, state);
++}
++HLE_FORCE("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", "stop the renderer: the SDK's own when it has one, success without audren:u when it does not",
++          Result, h_ar_Stop, void *obj, void *state) {
++    if (!ar_cpu_renderer()) return RES_OK;
++    static Result (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE");
++    return orig(obj, state);
++}
++HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE", "update the renderer: the SDK's own when it has one, success without audren:u when it does not",
++          Result, h_ar_Update, void *obj, void *state, const void *config) {
++    if (!ar_cpu_renderer()) return RES_OK;
++    static Result (*orig)(void *, void *, const void *); if (!orig) orig = gsym("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE");
++    return orig(obj, state, config);
++}
+ 
+ // DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44); SDK 8 (Link's Awakening)
+ //   has four fewer commands before it, making it 0x10. The layout is the same in all three: 0x148 bytes, +0x20 device name ("MainAudioOut"), +0x128 upsample buffer, +0x130 input count,
+diff --git a/dm/host/tests/t_audren_layout.c b/dm/host/tests/t_audren_layout.c
+index 0dcfc784..9daf7324 100644
+--- a/dm/host/tests/t_audren_layout.c
++++ b/dm/host/tests/t_audren_layout.c
+@@ -21,6 +21,7 @@ int dm_pcmout_append(void *k, void *b) { (void)k; (void)b; return 0; }
+ void *dm_pcmout_released(void *k) { (void)k; return NULL; }
+ void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
+ void hle_bind_system_event(void *ev, int ac) { (void)ev; (void)ac; }
++int hle_signal_bound_system_event(void *ev) { (void)ev; return 0; }
+ uint32_t hle_dup_readable_handle(uint32_t h) { return h; }
+ 
+ enum { SAMPLES = 240, NMIX = 8, NCMD = 6 };
+diff --git a/dm/host/tests/t_audren_work.c b/dm/host/tests/t_audren_work.c
+index cc8d9933..32acec18 100644
+--- a/dm/host/tests/t_audren_work.c
++++ b/dm/host/tests/t_audren_work.c
+@@ -64,7 +64,9 @@ static void sdk_close(void *obj, void *state) {
+     assert(((uint8_t *)obj)[SDK_WORK - 1] == 0x5a);   // storage is alive through SDK teardown
+     closes++;
+ }
++static int have_renderer = 1, silent;
+ void *guest_sym(const char *name) {
++    if (have_renderer && strstr(name, "ExecuteAudioRendererRendering")) return (void *)1;
+     if (!strcmp(name, hle_force_h_ar_WorkSize.name)) return sdk_size;
+     if (!strcmp(name, hle_force_h_ar_Open.name)) return sdk_open_ev;
+     if (!strcmp(name, hle_force_h_ar_Open0.name)) return sdk_open;
+@@ -96,9 +98,11 @@ int dm_pcmout_append(void *k, void *b) { (void)k; (void)b; return 0; }
+ void *dm_pcmout_released(void *k) { (void)k; return NULL; }
+ void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
+ void hle_bind_system_event(void *ev, int ac) {
++    if (silent) { assert(ev == game_event && ac == 1); return; }
+     assert(ev == sdk_event && ac == 1 && event_destroys == 2 * event_binds + 1);   // after the open destroys the SDK's local event (each earlier Close destroyed one more)
+     event_binds++;
+ }
++int hle_signal_bound_system_event(void *ev) { (void)ev; return 0; }
+ uint32_t hle_dup_readable_handle(uint32_t h) { assert(h == 0x1002); return 0x1003; }
+ 
+ int main(void) {
+@@ -182,6 +186,19 @@ int main(void) {
+         assert(handle[0] == work && allocations == a && !map_key);
+         h_ar_Close(handle[0], handle[1]);
+     }
++    // No in-process renderer: the SDK size and open connect to audren:u and abort. The service budget is returned without calling it, and an unknown revision is a fixed allocation.
++    have_renderer = 0; silent = 1;
++    memcpy(param, saved, sizeof param);
++    assert(h_ar_WorkSize(param) == SERVICE_WORK);
++    *(uint32_t *)(param + 0x34) = 0x40564552;
++    assert(h_ar_WorkSize(param) == SILENT_WORK);
++    memcpy(param, saved, sizeof param);
++    int so = opens, ss = starts, sc = closes, sa = allocations;
++    assert(!h_ar_Open(handle, event, param, work, SERVICE_WORK));
++    assert(handle[0] && opens == so && starts == ss && allocations == sa && closes == sc);
++    h_ar_Close(handle[0], handle[1]);
++    assert(opens == so && starts == ss && closes == sc);
++    assert(!h_ar_Start(handle[0], handle[1]) && !h_ar_Stop(handle[0], handle[1]) && !h_ar_Update(handle[0], handle[1], param));
+     free(work);
+     puts("audren work buffer: Horizon sizing fixtures, both opens, nested open, failures and close lifetime passed");
+     return 0;
+diff --git a/docs/reference/audio.md b/docs/reference/audio.md
+index d2946396..6de50e6c 100644
+--- a/docs/reference/audio.md
++++ b/docs/reference/audio.md
+@@ -15,6 +15,13 @@ Check whether the SDK carries the renderer: list the `sdk` module's exports for
+ The open then goes through `CreateAudioRendererManagerByDfc`; no IPC.
+ For a replaced DSP renderer the size query keeps the service's work-buffer contract; a larger local CPU representation is a backend cost. See [A sound engine's heap too small for its renderer and players](#a-sound-engines-heap-too-small-for-its-renderer-and-players).
+ 
++### An SDK whose renderer is only `audren:u`
++
++- **Symptom:** `[RED] sf: the game connects to service audren:u itself`, then `Break#1 reason=0 Result=0 svc` inside `GetAudioRendererWorkBufferSize` (`h_ar_WorkSize`). The process exits 42 before a frame.
++- **Cause:** the host drives the SDK's in-process renderer. This SDK exports neither `ExecuteAudioRendererRendering` nor `CreateAudioRendererManagerByDfc`. `GetAudioRendererWorkBufferSize` and `OpenAudioRenderer` connect to `audren:u` and abort when that service is not registered. A result-only reply is not enough: the client's size command takes an out handle, and a failed result still breaks.
++- **Fix:** when the `sdk` module has none of the in-process render entry points, the host does not call those functions (`hle_audren.c`). The work-buffer size is the service budget when the parameter revision is known, otherwise 8 MiB. Open, Start, Stop, RequestUpdate and Close are answered locally. Open binds the game's event and a host thread signals it every 5 ms, so the audio thread can leave `WaitSystemEvent`. There is no mixer, so the game is silent.
++- **Found on:** 無双OROCHI２ Ultimate (`0100153006300000`, 1.0.0, SDK 1.6.0). Not in the games table.
++
+ ### SDK 8's longer `AudioRendererParameter`
+ 
+ - **Symptom:** abort with Result 0x499 in `audio::GetAudioRendererWorkBufferSize`.

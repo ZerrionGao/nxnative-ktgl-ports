@@ -1,0 +1,79 @@
+commit 60d617e74ff80e6ec4b5b3998daf9af0e4673b33
+Author: seedds <seedds@gmail.com>
+Date:   Fri Nov 6 07:30:21 2026 -0500
+
+    读取 Unreal pak v9 的冻结索引，并配对 LINKDATA.IDX
+    
+    轩辕剑七的着色器库在版本 9 的 pak 里；无双 7 的 LINKDATA 用同名 IDX 而不是 BIN 里的索引。
+
+diff --git a/dm/gfx/tools/shader_split.py b/dm/gfx/tools/shader_split.py
+index 6e9b2561..0618ad25 100644
+--- a/dm/gfx/tools/shader_split.py
++++ b/dm/gfx/tools/shader_split.py
+@@ -19,7 +19,8 @@
+ #       NV assembly text follows the first 0x880 bytes of the control section, and SASS disassembly text follows the code area. All 478 files hold "vertex, pixel" in pairs (1, 2 or 4 pairs), paired two by two in order
+ #   · G2S (Koei Tecmo's KTGL, Hyrule Warriors: Age of Calamity): GLSLC compiler outputs inside the IDRK entries of the RDB data files (zlib in chunks), see idrk_shaders;
+ #       ROMANCE OF THE THREE KINGDOMS 8 REMAKE's newer RDB keeps them in .fdata files (a PDRK header, then IDRK entries of zlib or LZ4 chunks)
+-#   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin, see kt_shaders and linkdata_jobs
++#   · SPKG (the older KTGL of Fire Emblem: Three Houses): shader packages of G2S containers, loose and inside the LINKDATA archive DATA0.bin / DATA1.bin
++#       (also LINKDATA.BIN / LINKDATA.IDX, the same 32-byte records: Shin Sangoku Musou 7 with Moushouden DX), see kt_shaders and linkdata_jobs
+ #   · SDF (Capcom's RE Engine, Monster Hunter Rise): shader definitions inside the PAK archives (KPKA, entries zstd / deflate compressed), only the newest copy of each path, see kpka_jobs and sdf_shaders
+ #   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
+ #   · SPK (Capcom's MT Framework, The Great Ace Attorney Chronicles): the shader package inside an ARC archive (zlib entries), code area + control section per shader, see mtarc_members and mtspk_shaders
+@@ -542,9 +543,14 @@ def kt_shaders(d, label, out):
+     if d[:4] == b'SARC' or b'BNSH\0\0\0\0' in d: scan_blob(d, label, out)
+ 
+ def linkdata_index(path):
+-    """The index beside a LINKDATA archive, or None: Three Houses' DATA0.bin beside DATA1.bin, Pokemon Pokopia's LI_C0_R.IDX beside LD_C0_R.BIN (247 MB, 12,298 records, 700 GLSLC outputs: the same records and chunks)"""
++    """The index beside a LINKDATA archive, or None. The records are the same 32-byte entries and KTGL chunks in every case:
++    Three Houses' DATA0.bin beside DATA1.bin, LINKDATA.IDX beside LINKDATA.BIN (Shin Sangoku Musou 7 with Moushouden DX: 17,403 records, 7.4 GB),
++    Pokemon Pokopia's LI_C0_R.IDX beside LD_C0_R.BIN (247 MB, 12,298 records, 700 GLSLC outputs)"""
+     name = os.path.basename(path)
+-    idx = 'DATA0.bin' if name == 'DATA1.bin' else 'LI_' + name[3:-4] + '.IDX' if name.startswith('LD_') and name.endswith('.BIN') else None
++    if name == 'DATA1.bin': idx = 'DATA0.bin'
++    elif name == 'LINKDATA.BIN': idx = 'LINKDATA.IDX'
++    elif name.startswith('LD_') and name.endswith('.BIN'): idx = 'LI_' + name[3:-4] + '.IDX'
++    else: idx = None
+     idx = idx and os.path.join(os.path.dirname(path), idx)
+     return idx if idx and os.path.exists(idx) else None
+ 
+diff --git a/dm/tools/tests/test_linkdata_index.py b/dm/tools/tests/test_linkdata_index.py
+new file mode 100644
+index 00000000..234167be
+--- /dev/null
++++ b/dm/tools/tests/test_linkdata_index.py
+@@ -0,0 +1,34 @@
++"""shader_split.linkdata_index: the index file beside a LINKDATA archive.
++
++Three Houses uses DATA0.bin beside DATA1.bin, Pokémon Pokopia uses LI_<name>.IDX beside LD_<name>.BIN,
++and Shin Sangoku Musou 7 with Moushouden DX uses LINKDATA.IDX beside LINKDATA.BIN. The records are the same; only the names differ.
++"""
++import os
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO / 'dm/gfx/tools'))
++_had = os.environ.get('DM_GAME'); os.environ['DM_GAME'] = '010055D009F78000'   # shader_split loads a profile at import; other tests expect no default game
++import shader_split as ss
++if _had is None: del os.environ['DM_GAME']
++else: os.environ['DM_GAME'] = _had
++
++
++class LinkdataIndex(unittest.TestCase):
++    def test_known_pairs(self):
++        with tempfile.TemporaryDirectory() as d:
++            for name in ('DATA0.bin', 'DATA1.bin', 'LINKDATA.IDX', 'LINKDATA.BIN', 'LI_C0_R.IDX', 'LD_C0_R.BIN'):
++                Path(d, name).write_bytes(b'\0' * 32)
++            self.assertEqual(ss.linkdata_index(str(Path(d, 'DATA1.bin'))), str(Path(d, 'DATA0.bin')))
++            self.assertEqual(ss.linkdata_index(str(Path(d, 'LINKDATA.BIN'))), str(Path(d, 'LINKDATA.IDX')))
++            self.assertEqual(ss.linkdata_index(str(Path(d, 'LD_C0_R.BIN'))), str(Path(d, 'LI_C0_R.IDX')))
++            self.assertIsNone(ss.linkdata_index(str(Path(d, 'DATA0.bin'))))
++            Path(d, 'LINKDATA.IDX').unlink()
++            self.assertIsNone(ss.linkdata_index(str(Path(d, 'LINKDATA.BIN'))))
++
++
++if __name__ == '__main__':
++    unittest.main()

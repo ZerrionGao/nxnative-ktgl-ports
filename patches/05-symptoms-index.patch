@@ -1,0 +1,40 @@
+commit 3c7032df6bd508b1e1877120e262af79c5112ec5
+Author: seedds <seedds@gmail.com>
+Date:   Fri Nov 6 07:30:21 2026 -0500
+
+    把 audren、影片分配器和 pak v9 登记进症状索引
+
+diff --git a/docs/agents/symptoms.md b/docs/agents/symptoms.md
+index e5b8dc02..e6830528 100644
+--- a/docs/agents/symptoms.md
++++ b/docs/agents/symptoms.md
+@@ -287,12 +287,14 @@ One line per symptom in the [subsystem references](../reference/): what you see
+ - a movie shows as a black screen with the loading icon, one picture every few seconds, while its sound decoder keeps up. → [Video output slots: how far the extractor gets ahead](../reference/movies.md#video-output-slots-how-far-the-extractor-gets-ahead)
+ - a crash in the game's heap free (`sead::ExpHeap`) on a movie thread, a second into the first movie, at the same address every boot (`pc=main+0x42f980`, a free-list unlink through a link of 0x3f, `addr=0x47`). → [AAC decoders offer at most 32 outputs](../reference/movies.md#aac-decoders-offer-at-most-32-outputs)
+ - the movie then froze on its first second, its sound decoder full and the game taking no more audio. → [AAC output buffer size is one frame](../reference/movies.md#aac-output-buffer-size-is-one-frame)
++- `FATAL movie: missing SDK symbol _ZNK5movie6Buffer4DataEv` as the first movie's decoder is constructed (`h_movie_Decoder` ← the two-argument `movie::Decoder` constructor). → [SDK 1.6's `movie::Buffer` accessors are not const](../reference/movies.md#sdk-16s-moviebuffer-accessors-are-not-const)
+ - `FATAL movie: missing SDK symbol _ZNK5movie6Buffer10GetNvnSyncEv` at the first frame of the native-texture movie (H.264 into the game's RGBA texture, as in Monster Hunter Rise). → [SDK 4's `movie::Buffer` has no sync object](../reference/movies.md#sdk-4s-moviebuffer-has-no-sync-object)
+ - a native-texture movie shows as a strip of small grey copies at the top of the screen. → [Parameter sets in `Configure` made the H.264 decoder without RGBA](../reference/movies.md#parameter-sets-in-configure-made-the-h264-decoder-without-rgba)
+ - looping movie previews flash black at the end of every loop. → [Last picture kept across a flush and at end of stream](../reference/movies.md#last-picture-kept-across-a-flush-and-at-end-of-stream)
+ - a native-texture movie freezes on its 16th picture while the game keeps running; `DM_MOVIE_TRACE=1` shows 16 `AcquireOutputBufferIndex` / `GetOutputBuffer` pairs and no `ReleaseOutputBufferIndex`. → [`GetOutputBuffer` returns the output index in native-texture mode](../reference/movies.md#getoutputbuffer-returns-the-output-index-in-native-texture-mode)
+ - a native-texture movie jumps ahead for one picture and returns: every 17 pictures, each exactly 16 ahead (one cycle of the video output slots), the picture before it never shown. Text burnt into the movie shows the line being typed half a second later for one frame. → [A native-texture movie shows a picture 16 frames ahead, then goes back](../reference/movies.md#a-native-texture-movie-shows-a-picture-16-frames-ahead-then-goes-back)
+ - `[RED] movie: client texture format 0x9a is not RGBA8 / RGBX8 (sRGB included), writing in RGBA byte order`; a native-texture movie plays in the wrong colours, warm lamps blue. → [A BGRA8 client texture gets its movie with red and blue swapped](../reference/movies.md#a-bgra8-client-texture-gets-its-movie-with-red-and-blue-swapped)
++- a few frames, then `CRASH sig=11 addr=0` in the NVN module, the return address in the movie module. The fault is `android::RefBase`'s constructor storing its vtable through a null `this`, called from `android::AMessage::AMessage`, called from `android::NuCachedSource2::readAt` while `movie::NnExtractor::SetDataSource` parses an MPEG-4. `operator new` (`android::HeapObject::operator new` → `NvOsAlloc`) returned null. The message id in the registers is the fourcc `read`. → [The movie player's `NvOs` heap never receives the game's allocator](../reference/movies.md#the-movie-players-nvos-heap-never-receives-the-games-allocator)
+ - the game crashed on a null right after the failed open. → [`movie::Extractor` runs natively](../reference/movies.md#movieextractor-runs-natively)
+ - VP8 WebM movies play black; `movie::Decoder` is created with decoder type 2. → [VP8 uses the same libvpx worker and output paths](../reference/movies.md#vp8-uses-the-same-libvpx-worker-and-output-paths)
+ - a movie with a Vorbis track starts clean, then crackles and stutters. The log has no underrun and no red line, and with `DM_AUDIO_DUMP` the game's mix has exact zeros in whole 512-sample blocks (mostly one or two at a time, 11 to 21 ms). → [Vorbis output lengths at a window change](../reference/movies.md#vorbis-output-lengths-at-a-window-change)
+@@ -302,6 +304,7 @@ One line per symptom in the [subsystem references](../reference/): what you see
+ 
+ ## Audio
+ 
++- `[RED] sf: the game connects to service audren:u itself`, then `Break#1 reason=0 Result=0 svc` inside `GetAudioRendererWorkBufferSize` (`h_ar_WorkSize`). The process exits 42 before a frame. → [An SDK whose renderer is only `audren:u`](../reference/audio.md#an-sdk-whose-renderer-is-only-audrenu)
+ - abort with Result 0x499 in `audio::GetAudioRendererWorkBufferSize`. → [SDK 8's longer `AudioRendererParameter`](../reference/audio.md#sdk-8s-longer-audiorendererparameter)
+ - the game is silent; only the game's updates render (catch-up frames that nothing plays). The log has `audren: OpenAudioRenderer (no event)` and no `render thread started`. → [A renderer opened without an event](../reference/audio.md#a-renderer-opened-without-an-event)
+ - `[RED] audren: a second renderer` right after the first open, with the same work buffer and "original device 1 mode 1". → [The SDK's open with an event calls the open without one (`t_in_open`)](../reference/audio.md#the-sdks-open-with-an-event-calls-the-open-without-one-t_in_open)
+@@ -646,6 +649,7 @@ One line per symptom in the [subsystem references](../reference/): what you see
+ - the split stopped with `no bundle has a Shader type tree of the same hash to borrow`. → [Unity Shader layouts written out for players without bundles](../reference/shaders.md#unity-shader-layouts-written-out-for-players-without-bundles)
+ - the 3D battle scene was black behind a correct UI, with `[RED] shader 854a8afc9d07f88d is not in the shader map` and `the dispatched program has no compute shader`. → [Unity ComputeShader objects](../reference/shaders.md#unity-computeshader-objects)
+ - black, jagged holes in the ground of a map (whole tiles of the terrain mesh missing while others draw), with about 25 distinct `[RED] shader … is not in the shader map` keys and `program has no vertex shader`, on a Unity game whose `Shader` objects all split cleanly. → [GLSLC outputs in a Unity TextAsset](../reference/shaders.md#glslc-outputs-in-a-unity-textasset)
+ - `ValueError: …/Glow-Switch_0_P.utoc: shader group 0 has no chunk` from `uepak.py io_archive` while the NSP script decodes the shaders (`decode_ue_shaders`, after `[4/8] UE shader decode`). → [IoStore patch containers keep their shader groups in the base container](../reference/shaders.md#iostore-patch-containers-keep-their-shader-groups-in-the-base-container)
+ - `[RED] …/Nicola-Switch_0_P.pak: the index is encrypted and no window of main decrypts it` from the NSP script before `[5/8] UE shader decode` (the message now reads `no key in main (a 32-byte window or two 16-byte literals its code stores together) decrypts it`). → [An Unreal pak key split into two 16-byte literals](../reference/shaders.md#an-unreal-pak-key-split-into-two-16-byte-literals)
+ - `the RomFS has Unreal paks, but none … holds a shader code archive`, then `the shader split found no shaders in main or the RomFS`. → [Unreal Engine 4.27 shaders inline in cooked packages (LZ4)](../reference/shaders.md#unreal-engine-427-shaders-inline-in-cooked-packages-lz4)
